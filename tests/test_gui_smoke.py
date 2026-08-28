@@ -33,6 +33,10 @@ class GuiSmokeTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def setUp(self) -> None:
+        from PyQt6.QtCore import QSettings
+
+        # The window remembers its last mode, so start every test from a clean slate.
+        QSettings(self.gui.SETTINGS_ORG, self.gui.SETTINGS_APP).clear()
         self._tmp = tempfile.TemporaryDirectory()
         self.game = Path(self._tmp.name) / "Game"
         (self.game / "www" / "img" / "pictures").mkdir(parents=True)
@@ -81,15 +85,42 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIsNotNone(params)
         self.assertEqual(params["mode"], self.gui.MODE_PROJECT)
 
-        self.window.mode_control.set_value(self.gui.MODE_ASSETS)
-        self.assertEqual(self.window.extract_all_button.text(), "Извлечь всё")
+        self.window.mode_control.set_value(self.gui.MODE_FILES)
+        self.assertEqual(self.window.extract_all_button.text(), "Расшифровать файлы")
         self.assertTrue(self.window.structure_switch.isEnabled())
+
+    def test_every_mode_has_a_label_a_hint_and_an_action(self) -> None:
+        for mode in (self.gui.MODE_FILES, self.gui.MODE_EXTRACT, self.gui.MODE_PROJECT):
+            with self.subTest(mode=mode):
+                self.window.mode_control.set_value(mode)
+                self.assertEqual(
+                    self.window.extract_all_button.text(), self.gui.MODE_BUTTON_LABELS[mode]
+                )
+                self.assertIn("Что получится", self.window.mode_hint.text())
+                params = self.window._params()
+                self.assertIsNotNone(params)
+                self.assertEqual(params["mode"], mode)
+
+    def test_text_checkbox_only_applies_to_full_extraction(self) -> None:
+        self.window.mode_control.set_value(self.gui.MODE_EXTRACT)
+        self.assertTrue(self.window.text_check.isEnabled())
+        self.window.mode_control.set_value(self.gui.MODE_FILES)
+        self.assertFalse(self.window.text_check.isEnabled())
+
+    def test_unity_engine_forces_full_extraction(self) -> None:
+        self.window.mode_control.set_value(self.gui.MODE_FILES)
+        self.window.engine_combo.setCurrentText(self.gui.ENGINE_UNITY)
+        self.assertEqual(self.window._mode(), self.gui.MODE_EXTRACT)
+        self.assertFalse(self.window.mode_control._buttons[self.gui.MODE_PROJECT].isEnabled())
+        self.window.engine_combo.setCurrentText("auto")
+        self.assertTrue(self.window.mode_control._buttons[self.gui.MODE_PROJECT].isEnabled())
 
     def test_project_mode_names_the_folder_after_the_game(self) -> None:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         from test_project_mode import make_deployed_mv_game
 
         game = make_deployed_mv_game(Path(self._tmp.name))
+        self.window.mode_control.set_value(self.gui.MODE_FILES)
         self.window.auto_name_check.setChecked(True)
         self.window.input_edit.setText(str(game / "www" / "img"))
         self.assertEqual(self.window.output_name_edit.text(), "Marie's Adventure")

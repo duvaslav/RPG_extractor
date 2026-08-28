@@ -72,12 +72,15 @@ from output_structure import describe_structure
 from unity_extractor import (
     ENGINE_UNITY,
     UnityExtractionOptions,
+    collect_unity_sources,
     detect_unity_input,
     extract_unity,
 )
 
 from rpg_maker_tool import (
+    ASSET_EXTENSIONS,
     HEADER_LENGTH,
+    PLAIN_ASSET_EXTENSIONS,
     KeyCandidate,
     ProjectBuildOptions,
     build_editable_project,
@@ -97,7 +100,9 @@ from rpg_maker_tool import (
     find_keys_including_game_root,
     key_candidate_to_bytes,
     key_to_bytes,
+    iter_files,
     normalize_path,
+    preview_project_build,
     read_prefix,
     relpath,
     run_unified_extraction,
@@ -110,8 +115,32 @@ SETTINGS_APP = "AssetStudio"
 
 STRUCTURE_EXAMPLE = "img/pictures/Actor1.png"
 
-MODE_ASSETS = "assets"
+MODE_FILES = "files"
+MODE_EXTRACT = "extract"
 MODE_PROJECT = "project"
+
+MODE_BUTTON_LABELS = {
+    MODE_FILES: "Расшифровать файлы",
+    MODE_EXTRACT: "Извлечь всё",
+    MODE_PROJECT: "Собрать проект",
+}
+
+MODE_OUTPUT_HINTS = {
+    MODE_FILES: (
+        "Что получится: выбранные типы файлов, расшифрованные, прямо в папке вывода. "
+        "Ни текста, ни отчётов — просто файлы."
+    ),
+    MODE_EXTRACT: (
+        "Что получится: extracted/ — все выбранные типы (расшифрованные), "
+        "translation/translation.jsonl — текст для перевода, manifest.json — отчёт. "
+        "Для Unity, WOLF RPG и VX Ace это единственный рабочий режим."
+    ),
+    MODE_PROJECT: (
+        "Что получится: копия игры для редактора RPG Maker — папка www раскрывается в корень "
+        "проекта, зашифрованные ассеты расшифровываются, флаги шифрования в System.json "
+        "снимаются, при необходимости создаётся файл проекта. Только RPG Maker MV и MZ."
+    ),
+}
 
 INPUT_FILE_FILTER = (
     "Архивы игр (*.rgss3a *.rgss2a *.rgssad *.apk *.xapk *.aab *.obb *.assets *.bundle "
@@ -470,6 +499,7 @@ class SegmentedControl(QWidget):
             bold = QFont(button.font())
             bold.setBold(True)
             button.setMinimumWidth(QFontMetrics(bold).horizontalAdvance(label) + 44)
+            button.setMinimumHeight(QFontMetrics(bold).height() + 20)
             button.clicked.connect(lambda _checked, chosen=value: self.changed.emit(chosen))
             layout.addWidget(button)
             self._buttons[value] = button
@@ -488,6 +518,16 @@ class SegmentedControl(QWidget):
         if button is not None and not button.isChecked():
             button.setChecked(True)
             self.changed.emit(value)
+
+    def set_option_enabled(self, value: str, enabled: bool) -> None:
+        button = self._buttons.get(value)
+        if button is not None:
+            button.setEnabled(enabled)
+
+    def setEnabled(self, enabled: bool) -> None:  # noqa: N802 - Qt naming
+        super().setEnabled(enabled)
+        for button in self._buttons.values():
+            button.setEnabled(enabled)
 
 
 class StatusPill(QLabel):
@@ -649,16 +689,14 @@ class ToolWorker(QObject):
 
     def run(self) -> None:
         try:
-            if self.action == "inspect":
-                code = self._run_inspect()
+            if self.action == "check":
+                code = self._run_check()
+            elif self.action == "preview":
+                code = self._run_preview()
+            elif self.action == "files":
+                code = self._run_decrypt(dry_run=False)
             elif self.action == "extract-unified":
                 code = self._run_extract_unified()
-            elif self.action == "keys":
-                code = self._run_keys()
-            elif self.action == "decrypt":
-                code = self._run_decrypt(dry_run=False)
-            elif self.action == "dry-run":
-                code = self._run_decrypt(dry_run=True)
             elif self.action == "project":
                 code = self._run_project()
             else:
@@ -746,9 +784,11 @@ class ToolWorker(QObject):
             source=Path(self.params["input"]),
             output=Path(self.params["output"]),
             engine=self.params["engine"],
-            images=True,
-            text=True,
-            resources=True,
+            images="image" in self.params["kinds"],
+            text=self.params["text"],
+            resources=bool(self.params["kinds"]),
+            asset_kinds=set(self.params["kinds"]),
+            key=self.params["key"],
             include_comments=self.params["comments"],
             show_keys=self.params["show_keys"],
             overwrite=self.params["overwrite"],
@@ -778,6 +818,110 @@ class ToolWorker(QObject):
             {"action": "extract-unified", "manifest": manifest, "output": str(result.output)}
         )
         return 1 if manifest.get("errors") else 0
+
+    def _run_check(self) -> int:
+        """One diagnostic pass: engine, encryption key, how much is encrypted."""
+
+        code = self._run_inspect()
+        if self._use_unity_mode():
+            return code
+
+        input_path = normalize_path(Path(self.params["input"]))
+        jobs = collect_asset_jobs(input_path, None, {"image", "audio", "video"})
+        self.log.emit("")
+        self.log.emit(f"Зашифрованных/переименованных файлов: {len(jobs)}")
+        by_kind = Counter(job.kind for job in jobs)
+        for kind, count in sorted(by_kind.items()):
+            self.log.emit(f"  {kind}: {count}")
+
+        plain = Counter()
+        for path in iter_files(input_path):
+            kind = PLAIN_ASSET_EXTENSIONS.get(path.suffix.lower())
+            if kind:
+                plain[kind] += 1
+        if plain:
+            self.log.emit(
+                "Незашифрованных ассетов: "
+                + ", ".join(f"{kind}={count}" for kind, count in sorted(plain.items()))
+            )
+
+        self.log.emit("")
+        keys_code = self._run_keys()
+        if jobs and keys_code != 0:
+            self.log.emit(
+                "Ключ не найден, а зашифрованные файлы есть — впишите ключ вручную в «Дополнительно»."
+            )
+            return 1
+        return code
+
+    def _run_preview(self) -> int:
+        mode = self.params.get("mode", MODE_FILES)
+        if mode == MODE_PROJECT:
+            return self._preview_project()
+        if mode == MODE_EXTRACT:
+            return self._preview_extract()
+        return self._run_decrypt(dry_run=True)
+
+    def _preview_project(self) -> int:
+        options = ProjectBuildOptions(
+            source=Path(self.params["input"]),
+            output=Path(self.params["output"]),
+            key=self.params["key"],
+            engine=self.params["engine"],
+            include_runtime=self.params["include_runtime"],
+        )
+        game_root, planned = preview_project_build(options)
+        decrypted = sum(
+            1 for source, _target in planned if source.suffix.lower() in ASSET_EXTENSIONS
+        )
+        self.log.emit(f"Игра: {game_root}")
+        self.log.emit(f"Проект: {self.params['output']}")
+        self.log.emit(f"Файлов всего: {len(planned)}, из них расшифровать: {decrypted}")
+        self.log.emit("")
+        for source, target in planned[:50]:
+            self.log.emit(f"{source.name} -> {target}")
+        if len(planned) > 50:
+            self.log.emit(f"... и ещё {len(planned) - 50}")
+        self.progress.emit(1, 1)
+        return 0
+
+    def _preview_extract(self) -> int:
+        if self._use_unity_mode():
+            sources = collect_unity_sources(Path(self.params["input"]))
+            self.log.emit(f"Unity-архивов к обработке: {len(sources)}")
+            for path in sources[:50]:
+                self.log.emit(str(path))
+            if len(sources) > 50:
+                self.log.emit(f"... и ещё {len(sources) - 50}")
+            self.progress.emit(1, 1)
+            return 0
+
+        input_path = normalize_path(Path(self.params["input"]))
+        output = normalize_path(Path(self.params["output"]))
+        extracted = output / "extracted"
+        kinds = self.params["kinds"]
+        jobs = collect_asset_jobs(
+            input_path, extracted, kinds, self.params["preserve_structure"]
+        )
+        plain = 0
+        for path in iter_files(input_path):
+            suffix = path.suffix.lower()
+            if suffix in ASSET_EXTENSIONS:
+                continue
+            if PLAIN_ASSET_EXTENSIONS.get(suffix) in kinds:
+                plain += 1
+        self.log.emit(f"Расшифровать в extracted/: {len(jobs)}")
+        self.log.emit(f"Скопировать незашифрованных в extracted/: {plain}")
+        if self.params["text"]:
+            self.log.emit("Собрать текст в translation/translation.jsonl")
+        self.log.emit("Записать отчёт manifest.json")
+        self.log.emit("")
+        for job in jobs[:50]:
+            self.log.emit(f"{job.source} -> {job.output}")
+        if len(jobs) > 50:
+            self.log.emit(f"... и ещё {len(jobs) - 50}")
+        self.progress.emit(1, 1)
+        return 0
 
     def _run_project(self) -> int:
         if self.cancel_requested:
@@ -930,7 +1074,7 @@ class ToolWorker(QObject):
             "Done: "
             + ", ".join(f"{status}={count}" for status, count in sorted(by_status.items()))
         )
-        self.result.emit({"action": "decrypt", "output": str(output_path)})
+        self.result.emit({"action": "files", "output": str(output_path)})
         return 1 if by_status.get("error") else 0
 
 
@@ -1068,11 +1212,15 @@ class MainWindow(QMainWindow):
             ]
         )
         self.engine_combo.currentTextChanged.connect(self._apply_engine_mode)
-        self.inspect_button = QPushButton("Определить движок")
-        self.inspect_button.clicked.connect(lambda: self._start_worker("inspect"))
+        self.check_button = QPushButton("Проверить игру")
+        self.check_button.setToolTip(
+            "Определить движок, найти ключ шифрования и посчитать, сколько файлов зашифровано.\n"
+            "Ничего не записывает."
+        )
+        self.check_button.clicked.connect(lambda: self._start_worker("check"))
         engine_row.addWidget(QLabel("Движок"))
         engine_row.addWidget(self.engine_combo, stretch=1)
-        engine_row.addWidget(self.inspect_button)
+        engine_row.addWidget(self.check_button)
         card.add_layout(engine_row)
 
         hint = QLabel("Папку или файл можно перетащить прямо в окно.")
@@ -1083,18 +1231,23 @@ class MainWindow(QMainWindow):
         return card
 
     def _build_mode_card(self) -> QWidget:
-        card = Card("Режим")
+        card = Card("Что делаем")
         self.mode_control = SegmentedControl(
             [
                 (
-                    MODE_ASSETS,
-                    "Извлечь ассеты",
-                    "Достать картинки, аудио и текст в отдельную папку",
+                    MODE_FILES,
+                    "Только файлы",
+                    "Расшифровать выбранные типы прямо в папку вывода",
+                ),
+                (
+                    MODE_EXTRACT,
+                    "Полное извлечение",
+                    "Ассеты + текст для перевода + отчёт; единственный режим для Unity, WOLF и VX Ace",
                 ),
                 (
                     MODE_PROJECT,
-                    "Распаковать в проект",
-                    "Собрать копию игры, готовую к открытию в редакторе RPG Maker",
+                    "Проект для редактора",
+                    "Собрать копию игры, которую открывает редактор RPG Maker",
                 ),
             ]
         )
@@ -1296,24 +1449,23 @@ class MainWindow(QMainWindow):
 
         buttons = QHBoxLayout()
         buttons.setSpacing(8)
-        self.find_keys_button = QPushButton("Найти ключи")
-        self.find_keys_button.clicked.connect(lambda: self._start_worker("keys"))
-        self.dry_run_button = QPushButton("Пробный прогон")
-        self.dry_run_button.clicked.connect(lambda: self._start_worker("dry-run"))
-        self.decrypt_button = QPushButton("Декодировать")
-        self.decrypt_button.clicked.connect(lambda: self._start_worker("decrypt"))
+        self.preview_button = QPushButton("Предпросмотр")
+        self.preview_button.setToolTip(
+            "Показать, что именно будет сделано в текущем режиме. Ничего не записывает."
+        )
+        self.preview_button.clicked.connect(lambda: self._start_worker("preview"))
         self.open_output_button = QPushButton("Открыть результат")
+        self.open_output_button.setToolTip("Открыть папку с результатом в проводнике")
         self.open_output_button.clicked.connect(self._open_output)
         self.open_output_button.setEnabled(False)
         self.cancel_button = QPushButton("Отмена")
+        self.cancel_button.setToolTip("Остановить текущую операцию (Esc)")
         self.cancel_button.clicked.connect(self._cancel_worker)
-        self.extract_all_button = QPushButton("Извлечь всё")
+        self.extract_all_button = QPushButton(MODE_BUTTON_LABELS[MODE_FILES])
         self.extract_all_button.setObjectName("Primary")
         self.extract_all_button.clicked.connect(self._run_primary)
 
-        buttons.addWidget(self.find_keys_button)
-        buttons.addWidget(self.dry_run_button)
-        buttons.addWidget(self.decrypt_button)
+        buttons.addWidget(self.preview_button)
         buttons.addWidget(self.open_output_button)
         buttons.addStretch(1)
         buttons.addWidget(self.cancel_button)
@@ -1451,27 +1603,25 @@ class MainWindow(QMainWindow):
 
     # ----------------------------------------------------------------- state
 
-    def _run_primary(self) -> None:
-        self._start_worker(
-            "project" if self.mode_control.value() == MODE_PROJECT else "extract-unified"
-        )
+    def _mode(self) -> str:
+        return self.mode_control.value()
 
     def _is_project_mode(self) -> bool:
-        return self.mode_control.value() == MODE_PROJECT
+        return self._mode() == MODE_PROJECT
+
+    def _run_primary(self) -> None:
+        actions = {
+            MODE_FILES: "files",
+            MODE_EXTRACT: "extract-unified",
+            MODE_PROJECT: "project",
+        }
+        self._start_worker(actions[self._mode()])
 
     def _apply_mode(self, _value: str | None = None) -> None:
-        project = self._is_project_mode()
-        self.extract_all_button.setText("Собрать проект" if project else "Извлечь всё")
-        if project:
-            self.mode_hint.setText(
-                "Копия игры, готовая к открытию в редакторе: папка www раскрывается в корень "
-                "проекта, зашифрованные ассеты расшифровываются, флаги шифрования в System.json "
-                "снимаются, при необходимости создаётся файл проекта. Только RPG Maker MV и MZ."
-            )
-        else:
-            self.mode_hint.setText(
-                "Картинки, аудио и текст выгружаются в отдельную папку — игра не собирается."
-            )
+        mode = self._mode()
+        self.extract_all_button.setText(MODE_BUTTON_LABELS[mode])
+        self.extract_all_button.setToolTip(MODE_OUTPUT_HINTS[mode])
+        self.mode_hint.setText(MODE_OUTPUT_HINTS[mode])
         self._apply_engine_mode()
         self._update_auto_output_name()
         self._update_output_preview()
@@ -1482,18 +1632,25 @@ class MainWindow(QMainWindow):
         engine = self.engine_combo.currentText()
         is_unity = engine == ENGINE_UNITY
         is_auto = engine == ENGINE_AUTO
-        # A project is a full copy of the game, so the asset filters and the
-        # flat layout have nothing to act on.
-        project = self._is_project_mode()
+        mode = self._mode()
+        project = mode == MODE_PROJECT
+        files_only = mode == MODE_FILES
+
+        # Unity games can only be handled by the full extraction pipeline.
+        self.mode_control.set_option_enabled(MODE_FILES, not is_unity)
+        self.mode_control.set_option_enabled(MODE_PROJECT, not is_unity)
+        if is_unity and mode != MODE_EXTRACT:
+            self.mode_control.set_value(MODE_EXTRACT)
+            return
 
         for widget in (
             self.key_label,
             self.key_edit,
             self.strict_check,
             self.force_xor_check,
-            self.preserve_time_check,
         ):
             widget.setEnabled(not is_unity)
+        self.preserve_time_check.setEnabled(not is_unity and not project)
         for widget in (self.comments_check, self.show_keys_check):
             widget.setEnabled(not is_unity and not project)
 
@@ -1501,20 +1658,20 @@ class MainWindow(QMainWindow):
         self.unity_version_label.setEnabled(unity_fields)
         self.unity_version_edit.setEnabled(unity_fields)
 
+        # A project is a full copy of the game, so the asset filters and the
+        # flat layout have nothing to act on. "Only files" writes no text.
         self.images_check.setEnabled(not project)
         self.audio_check.setEnabled(not project)
         self.video_check.setEnabled(not is_unity and not project)
-        self.text_check.setEnabled((is_unity or is_auto) and not project)
-        self.fonts_check.setEnabled((is_unity or is_auto) and not project)
+        self.text_check.setEnabled(not project and not files_only)
+        self.fonts_check.setEnabled((is_unity or is_auto) and not project and not files_only)
 
         self.structure_card.setEnabled(not project)
         self.structure_switch.setEnabled(not project)
         self.include_runtime_check.setEnabled(project)
 
         if self.worker is None:
-            self.find_keys_button.setEnabled(not is_unity)
-            self.dry_run_button.setEnabled(not is_unity and not project)
-            self.decrypt_button.setEnabled(not is_unity and not project)
+            self.preview_button.setEnabled(True)
 
     def _selected_kinds(self) -> set[str]:
         kinds: set[str] = set()
@@ -1583,7 +1740,8 @@ class MainWindow(QMainWindow):
             "force_xor": self.force_xor_check.isChecked(),
             "preserve_time": self.preserve_time_check.isChecked(),
             "preserve_structure": self.structure_switch.isChecked(),
-            "mode": self.mode_control.value(),
+            "mode": self._mode(),
+            "text": self.text_check.isChecked(),
             "include_runtime": self.include_runtime_check.isChecked(),
             "verbose": self.verbose_check.isChecked(),
             "comments": self.comments_check.isChecked(),
@@ -1608,11 +1766,11 @@ class MainWindow(QMainWindow):
             params["engine"] == ENGINE_AUTO
             and detect_unity_input(Path(params["input"])).confidence >= 0.65
         )
-        if unity_mode and action not in {"inspect", "extract-unified", "project"}:
+        if unity_mode and action in {"files", "project"}:
             QMessageBox.information(
                 self,
                 "Unity",
-                "Для Unity используйте «Определить движок» или «Извлечь всё».",
+                "Для Unity доступен только режим «Полное извлечение».",
             )
             return
         self.log_edit.clear()
@@ -1677,7 +1835,7 @@ class MainWindow(QMainWindow):
                     f"{detection.engine} · {detection.confidence:.2f}{edition}", state
                 )
             return
-        if action in {"extract-unified", "decrypt", "project"}:
+        if action in {"extract-unified", "files", "project"}:
             output = result.get("output")
             if output:
                 self.last_output = Path(output)
@@ -1719,12 +1877,11 @@ class MainWindow(QMainWindow):
             self.input_button,
             self.input_file_button,
             self.output_parent_button,
-            self.inspect_button,
-            self.find_keys_button,
-            self.dry_run_button,
+            self.check_button,
+            self.preview_button,
             self.extract_all_button,
-            self.decrypt_button,
             self.structure_switch,
+            self.mode_control,
         ):
             widget.setEnabled(not busy)
         self.cancel_button.setEnabled(busy)
@@ -1758,7 +1915,7 @@ class MainWindow(QMainWindow):
             str(settings.value("output_parent", str(DEFAULT_OUTPUT_PARENT)))
         )
         self.engine_combo.setCurrentText(str(settings.value("engine", ENGINE_AUTO)))
-        self.mode_control.set_value(str(settings.value("mode", MODE_ASSETS)))
+        self.mode_control.set_value(str(settings.value("mode", MODE_FILES)))
         for key, widget in self._persisted_checks().items():
             stored = settings.value(key)
             if stored is not None:
@@ -1773,7 +1930,7 @@ class MainWindow(QMainWindow):
         settings.setValue("input", self.input_edit.text().strip())
         settings.setValue("output_parent", self.output_parent_edit.text().strip())
         settings.setValue("engine", self.engine_combo.currentText())
-        settings.setValue("mode", self.mode_control.value())
+        settings.setValue("mode", self._mode())
         settings.setValue("workers", self.workers_spin.value())
         for key, widget in self._persisted_checks().items():
             settings.setValue(key, widget.isChecked())

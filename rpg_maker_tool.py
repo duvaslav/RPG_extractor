@@ -281,6 +281,10 @@ class ExtractionOptions:
     images: bool = False
     text: bool = False
     resources: bool = True
+    # Exact asset kinds to extract ("image", "audio", "video"). Empty means
+    # "decide from the images/resources flags", which is what the CLI does.
+    asset_kinds: set[str] = field(default_factory=set)
+    key: str = "auto"
     include_comments: bool = False
     show_keys: bool = False
     overwrite: bool = False
@@ -1385,6 +1389,71 @@ def score_key_candidates_against_assets(
                 source = f"asset validation: {first_hit}"
                 if source not in candidate.sources:
                     candidate.sources.append(source)
+
+
+PLAIN_ASSET_EXTENSIONS: dict[str, str] = {
+    ".png": "image",
+    ".jpg": "image",
+    ".jpeg": "image",
+    ".webp": "image",
+    ".bmp": "image",
+    ".ogg": "audio",
+    ".m4a": "audio",
+    ".mp3": "audio",
+    ".wav": "audio",
+    ".webm": "video",
+    ".mp4": "video",
+}
+
+
+def copy_plain_assets(
+    input_path: Path,
+    output_root: Path,
+    kinds: set[str],
+    preserve_structure: bool = True,
+    allocator: FlatNameAllocator | None = None,
+    overwrite: bool = False,
+) -> Counter[str]:
+    """Copy assets the game never encrypted into the same output tree.
+
+    Most games encrypt only part of their assets. Without this, extracting a
+    partly-encrypted game would silently skip every plain .png next to the
+    encrypted ones.
+    """
+
+    input_path = normalize_path(input_path)
+    output_root = normalize_path(output_root)
+    copied: Counter[str] = Counter()
+    if not kinds:
+        return copied
+
+    for source in sorted(iter_files(input_path)):
+        suffix = source.suffix.lower()
+        if suffix in ASSET_EXTENSIONS:
+            continue
+        kind = PLAIN_ASSET_EXTENSIONS.get(suffix)
+        if kind is None or kind not in kinds:
+            continue
+        try:
+            source.relative_to(output_root)
+            continue  # never re-copy our own output
+        except ValueError:
+            pass
+        relative = Path(source.name) if input_path.is_file() else source.relative_to(input_path)
+        target = safe_output_path(
+            output_root, plan_output_relative(relative, preserve_structure, allocator)
+        )
+        if target.exists() and not overwrite:
+            copied["skipped"] += 1
+            continue
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            copied[kind] += 1
+            copied["total"] += 1
+        except OSError:
+            copied["failed"] += 1
+    return copied
 
 
 def collect_asset_jobs(
@@ -2530,7 +2599,6 @@ class RpgMakerEngineAdapter:
         source = normalize_path(options.source)
         output = normalize_path(options.output)
         extracted_dir = output / "extracted"
-        images_dir = output / "images"
         logs_dir = output / "logs"
         output.mkdir(parents=True, exist_ok=True)
         extracted_dir.mkdir(parents=True, exist_ok=True)
@@ -2538,14 +2606,21 @@ class RpgMakerEngineAdapter:
         warnings: list[str] = []
         errors: list[str] = []
 
-        if options.resources:
+        if options.asset_kinds:
+            kinds = set(options.asset_kinds)
+        elif options.resources:
             kinds = {"image", "audio", "video"}
         elif options.images:
             kinds = {"image"}
         else:
             kinds = set()
-        jobs = collect_asset_jobs(source, extracted_dir, kinds, options.preserve_structure)
-        key = resolve_key_arg("auto", source, quiet=True)
+        # One allocator for the whole folder so decrypted and plain assets
+        # cannot claim the same flat name.
+        allocator = None if options.preserve_structure else FlatNameAllocator()
+        jobs = collect_asset_jobs(
+            source, extracted_dir, kinds, options.preserve_structure, allocator
+        )
+        key = resolve_key_arg(options.key or "auto", source, quiet=True)
         if jobs and key is None:
             errors.append("No RPG Maker encryption key was found.")
 
@@ -2572,12 +2647,19 @@ class RpgMakerEngineAdapter:
                     if result.status == "error":
                         errors.append(f"{relpath(result.source, source)}: {result.message}")
 
-        image_count = 0
-        if options.images or options.resources:
-            image_count, _index, image_warnings = extract_images_from_tree(
-                extracted_dir, images_dir, options.preserve_structure
-            )
-            warnings.extend(image_warnings)
+        plain = copy_plain_assets(
+            source,
+            extracted_dir,
+            kinds,
+            options.preserve_structure,
+            allocator,
+            options.overwrite,
+        )
+        # Decrypted assets already land in extracted/ in their final form, so a
+        # second copy under images/ would only double the disk usage.
+        image_count = sum(
+            1 for result in results if result.kind == "image" and result.status in {"ok", "skipped"}
+        ) + plain["image"]
 
         manifest = {
             "engine": self.engine_id,
@@ -2590,6 +2672,10 @@ class RpgMakerEngineAdapter:
             "protection_key_detected": False,
             "archives_processed": 0,
             "folder_structure": structure_mode(options.preserve_structure),
+            "asset_kinds": sorted(kinds),
+            "assets_decrypted": sum(1 for result in results if result.status == "ok"),
+            "plain_assets_copied": plain["total"],
+            "images_location": "extracted",
             "images_extracted": image_count,
             "text_entries_extracted": 0,
             "warnings": warnings,
@@ -2735,7 +2821,7 @@ def run_unified_extraction(options: ExtractionOptions) -> ExtractionResult:
     if not validation.ok:
         raise ValueError("; ".join(validation.errors))
     resource_result = adapter.extract_resources(options)
-    if options.text or (not options.images and not options.resources):
+    if options.text:
         text_result = adapter.extract_text(options)
         resource_result.text_entries = text_result.count
         resource_result.manifest["text_entries_extracted"] = text_result.count
@@ -2896,6 +2982,27 @@ def ensure_project_marker(project_root: Path, engine: str) -> str | None:
     name, content = marker
     (project_root / name).write_text(f"{content}\n", encoding="utf-8")
     return name
+
+
+def preview_project_build(options: ProjectBuildOptions) -> tuple[Path, list[tuple[Path, Path]]]:
+    """What a project build would produce: the game root and every source → target pair."""
+
+    source = normalize_path(options.source)
+    game_root = find_game_root_upwards(source) or resolve_game_root(source)
+    detection = detect_engine(game_root, options.engine)
+    if detection.engine not in PROJECT_MARKERS:
+        raise ValueError(
+            "Project mode supports RPG Maker MV and MZ only; "
+            f"detected engine: {detection.engine}."
+        )
+    output = normalize_path(options.output)
+    content_root = project_content_root(game_root)
+    planned: list[tuple[Path, Path]] = []
+    for source_path, relative in plan_project_copy(game_root, content_root, options.include_runtime):
+        mapped = ASSET_EXTENSIONS.get(source_path.suffix.lower())
+        target_relative = relative.with_suffix(mapped[0]) if mapped else relative
+        planned.append((source_path, output / target_relative))
+    return game_root, planned
 
 
 def build_editable_project(
@@ -3331,6 +3438,7 @@ def command_extract(args: argparse.Namespace) -> int:
         strict=not args.no_strict,
         workers=args.workers,
         preserve_structure=not args.flat,
+        key=args.key,
         uberwolf_cli=args.uberwolf_cli,
         wolftl_cli=args.wolftl_cli,
     )
@@ -3619,6 +3727,11 @@ def build_parser() -> argparse.ArgumentParser:
     extract.add_argument("--resources", action="store_true", help="unpack/decrypt resources")
     extract.add_argument("--images", action="store_true", help="extract/copy image resources only")
     extract.add_argument("--text", action="store_true", help="extract translatable text")
+    extract.add_argument(
+        "--key",
+        default="auto",
+        help="32-hex encryption key, or 'auto' to search project files (default)",
+    )
     extract.add_argument("--comments", action="store_true", help="include developer comments where supported")
     extract.add_argument("--show-keys", action="store_true", help="allow backend logs to contain detected keys")
     extract.add_argument("--overwrite", action="store_true")
