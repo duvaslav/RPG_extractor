@@ -36,6 +36,9 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Protocol
 from urllib.parse import unquote
 
+import pgmmv
+from pgmmv import ENGINE_PIXEL_GAME_MAKER_MV
+
 from output_structure import (
     STRUCTURE_FLATTEN,
     STRUCTURE_PRESERVE,
@@ -75,6 +78,7 @@ ENGINE_RPGMAKER_MV = "rpgmaker-mv"
 ENGINE_RPGMAKER_MZ = "rpgmaker-mz"
 ENGINE_RPGMAKER_VX_ACE = "rpgmaker-vx-ace"
 ENGINE_WOLF_RPG = "wolf-rpg"
+ENGINE_UNKNOWN = "unknown"
 def _default_output_parent() -> Path:
     """Where extractions land unless the user picks something else.
 
@@ -97,6 +101,7 @@ SUPPORTED_ENGINES = {
     ENGINE_RPGMAKER_MZ,
     ENGINE_RPGMAKER_VX_ACE,
     ENGINE_WOLF_RPG,
+    ENGINE_PIXEL_GAME_MAKER_MV,
 }
 RGSS_ARCHIVE_EXTENSIONS = {".rgssad", ".rgss2a", ".rgss3a"}
 WOLF_ARCHIVE_EXTENSIONS = {
@@ -312,6 +317,8 @@ class TextExtractionResult:
     output: Path | None = None
     warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # Extra manifest fields the text pass discovered, e.g. per-locale counts.
+    details: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -874,24 +881,34 @@ def probe_wolf_rpg(path: Path) -> DetectionResult:
         score += 0.35
         evidence.append(f"WOLF archive input found: {path.name}")
 
-    if has_file(root, "GamePro.exe"):
-        score += 0.28
-        edition = "pro"
-        evidence.append("GamePro.exe found")
-    if has_file(root, "Game.exe"):
-        score += 0.22
-        evidence.append("Game.exe found")
-    if has_file(root, "Data.wolf"):
-        score += 0.24
-        evidence.append("Data.wolf found")
-    if has_dir(root, "Data"):
-        score += 0.14
-        evidence.append("Data folder found")
-
     data_root = root / "Data"
     has_game_dat = has_file(data_root, "Game.dat") or has_file(root, "Game.dat")
     has_basic_data = has_dir(data_root, "BasicData") or has_file(data_root, "BasicData.wolf")
     has_map_data = has_dir(data_root, "MapData") or has_file(data_root, "MapData.wolf")
+    has_data_wolf = has_file(root, "Data.wolf")
+    # Game.exe and a Data folder are named the same in half the engines out
+    # there, so they only count once something WOLF-specific is also present.
+    wolf_specific = bool(
+        has_game_dat
+        or has_basic_data
+        or has_map_data
+        or has_data_wolf
+        or count_files_by_suffix(root, {".wolf", ".mps"}, limit=5)
+    )
+
+    if has_file(root, "GamePro.exe"):
+        score += 0.28
+        edition = "pro"
+        evidence.append("GamePro.exe found")
+    if has_file(root, "Game.exe") and wolf_specific:
+        score += 0.22
+        evidence.append("Game.exe found")
+    if has_data_wolf:
+        score += 0.24
+        evidence.append("Data.wolf found")
+    if has_dir(root, "Data") and wolf_specific:
+        score += 0.14
+        evidence.append("Data folder found")
 
     archive_paths = discover_wolf_archives(root)
     wolf_archive_count = sum(1 for item in archive_paths if item.suffix.lower() == ".wolf")
@@ -938,6 +955,19 @@ def probe_wolf_rpg(path: Path) -> DetectionResult:
     )
 
 
+def probe_pixel_game_maker_mv(path: Path) -> DetectionResult:
+    root = resolve_game_root(path)
+    detection = pgmmv.detect_pixel_game_maker(root)
+    return DetectionResult(
+        ENGINE_PIXEL_GAME_MAKER_MV,
+        detection.confidence,
+        detection.evidence,
+        edition=detection.edition,
+        root=root,
+        warnings=detection.warnings,
+    )
+
+
 def detect_engine(path: Path, override: str = ENGINE_AUTO) -> DetectionResult:
     if override not in SUPPORTED_ENGINES:
         raise ValueError(f"unsupported engine override: {override}")
@@ -972,16 +1002,43 @@ def detect_engine(path: Path, override: str = ENGINE_AUTO) -> DetectionResult:
         result.confidence = max(result.confidence, 0.51 if result.evidence else 0.0)
         result.evidence.append("manual override: wolf-rpg")
         return result
+    if override == ENGINE_PIXEL_GAME_MAKER_MV:
+        result = probe_pixel_game_maker_mv(path)
+        result.confidence = max(result.confidence, 0.51 if result.evidence else 0.0)
+        result.evidence.append("manual override: pixel-game-maker-mv")
+        return result
 
-    candidates = [probe_rpgmaker(path), probe_rpgmaker_vx_ace(path), probe_wolf_rpg(path)]
+    candidates = [
+        probe_rpgmaker(path),
+        probe_rpgmaker_vx_ace(path),
+        probe_wolf_rpg(path),
+        probe_pixel_game_maker_mv(path),
+    ]
     candidates.sort(key=lambda item: item.confidence, reverse=True)
     best = candidates[0]
     second = candidates[1] if len(candidates) > 1 else None
     if best.confidence < 0.35:
-        best.warnings.append(
-            "Engine confidence is too low. Use --engine rpgmaker-mv, rpgmaker-mz, rpgmaker-vx-ace, or wolf-rpg."
+        # Naming the closest engine here is how a Pixel Game Maker game ends up
+        # labelled "wolf-rpg at 0.22". Report that nothing matched instead, and
+        # show what was actually seen.
+        seen = [
+            f"{item.engine}={item.confidence:.2f}"
+            for item in candidates
+            if item.confidence > 0.0
+        ]
+        unknown = DetectionResult(
+            ENGINE_UNKNOWN,
+            best.confidence,
+            [f"closest matches: {', '.join(seen)}" if seen else "no engine markers found"]
+            + [f"{item.engine}: {line}" for item in candidates for line in item.evidence],
+            root=best.root,
+            warnings=[
+                "The engine could not be identified. This game is not one of the supported "
+                "engines, or its files are laid out in a way the detector does not know.",
+            ],
         )
-    elif second and second.confidence >= 0.30 and best.confidence - second.confidence < 0.30:
+        return unknown
+    if second and second.confidence >= 0.30 and best.confidence - second.confidence < 0.30:
         best.warnings.append(
             f"Conflicting engine evidence: {best.engine}={best.confidence:.2f}, "
             f"{second.engine}={second.confidence:.2f}. Use --engine to override."
@@ -1403,6 +1460,9 @@ PLAIN_ASSET_EXTENSIONS: dict[str, str] = {
     ".wav": "audio",
     ".webm": "video",
     ".mp4": "video",
+    ".ttf": "font",
+    ".otf": "font",
+    ".ttc": "font",
 }
 
 
@@ -1439,6 +1499,12 @@ def copy_plain_assets(
             continue  # never re-copy our own output
         except ValueError:
             pass
+        state, _kind, _magic = pgmmv.classify_file(source)
+        if state == "protected":
+            # Named .png but carrying a protection header: copying it would
+            # produce an unreadable file that looks fine in a folder listing.
+            copied["protected"] += 1
+            continue
         relative = Path(source.name) if input_path.is_file() else source.relative_to(input_path)
         target = safe_output_path(
             output_root, plan_output_relative(relative, preserve_structure, allocator)
@@ -2798,6 +2864,163 @@ class WolfRpgEngineAdapter:
         return PatchResult(True, patched_game)
 
 
+class PixelGameMakerEngineAdapter:
+    """Pixel Game Maker MV.
+
+    Resource protection is not implemented: the format is not documented and
+    has not been verified against a real game, so protected files are counted
+    and reported rather than written out as unreadable copies. Everything that
+    is not protected — plain images, audio, fonts and the localized project
+    text — is extracted normally.
+    """
+
+    engine_id = ENGINE_PIXEL_GAME_MAKER_MV
+
+    def probe(self, path: Path) -> DetectionResult:
+        return probe_pixel_game_maker_mv(path)
+
+    def validate(self, path: Path) -> ValidationResult:
+        detection = pgmmv.detect_pixel_game_maker(resolve_game_root(path))
+        if detection.confidence < 0.35:
+            return ValidationResult(
+                False,
+                warnings=detection.warnings,
+                errors=["Resources/data/project.json was not found; not a Pixel Game Maker MV game."],
+            )
+        return ValidationResult(True, warnings=detection.warnings)
+
+    def extract_resources(self, options: ExtractionOptions) -> ExtractionResult:
+        started = datetime.now(timezone.utc)
+        source = normalize_path(options.source)
+        game_root = resolve_game_root(source)
+        output = normalize_path(options.output)
+        extracted_dir = output / "extracted"
+        output.mkdir(parents=True, exist_ok=True)
+        extracted_dir.mkdir(parents=True, exist_ok=True)
+        warnings: list[str] = []
+        errors: list[str] = []
+
+        detection = pgmmv.detect_pixel_game_maker(game_root)
+        warnings.extend(detection.warnings)
+        resources_root = detection.resources_root or game_root
+
+        kinds = set(options.asset_kinds) or {"image", "audio", "video", "font"}
+        scan = pgmmv.scan_resources(resources_root)
+        allocator = None if options.preserve_structure else FlatNameAllocator()
+        plain = copy_plain_assets(
+            resources_root,
+            extracted_dir,
+            kinds,
+            options.preserve_structure,
+            allocator,
+            options.overwrite,
+        )
+
+        if scan.protected_total:
+            magics = ", ".join(
+                f"{magic} x{count}" for magic, count in sorted(scan.protected_magics.items())
+            )
+            warnings.append(
+                f"{scan.protected_total} protected resource(s) were left in place: "
+                "Pixel Game Maker MV resource protection is not supported yet "
+                f"(headers seen: {magics})."
+            )
+        if detection.has_protection_key:
+            warnings.append(
+                "info.json carries protection key metadata, but the protection format is not implemented."
+            )
+
+        manifest = {
+            "engine": ENGINE_PIXEL_GAME_MAKER_MV,
+            "edition": detection.edition,
+            "detection_confidence": detection.confidence,
+            "project_version": detection.project_version,
+            "player_version": detection.player_version,
+            "source_root": str(game_root),
+            "resources_root": str(resources_root),
+            "extraction_time": started.isoformat(),
+            "encrypted": bool(scan.protected_total),
+            "key_detected": False,
+            "key_status": (
+                "metadata present, format unsupported"
+                if detection.has_protection_key
+                else "not found"
+            ),
+            "protection_key_detected": detection.has_protection_key,
+            "archives_processed": 0,
+            "folder_structure": structure_mode(options.preserve_structure),
+            "asset_kinds": sorted(kinds),
+            "resources_scanned": scan.total_files,
+            "protected_by_kind": dict(sorted(scan.protected.items())),
+            "plain_by_kind": dict(sorted(scan.plain.items())),
+            "protected_total": scan.protected_total,
+            "protected_headers": dict(sorted(scan.protected_magics.items())),
+            "unreadable_files": scan.unknown,
+            "assets_copied": plain["total"],
+            "assets_skipped_existing": plain["skipped"],
+            "assets_failed": plain["failed"],
+            "images_extracted": plain["image"],
+            "images_location": "extracted",
+            "text_entries_extracted": 0,
+            "locales": {},
+            "excluded_directories": [],
+            "duration_seconds": round(
+                (datetime.now(timezone.utc) - started).total_seconds(), 3
+            ),
+            "warnings": warnings,
+            "errors": errors,
+        }
+        atomic_write_json(output / "manifest.json", manifest)
+        return ExtractionResult(
+            ENGINE_PIXEL_GAME_MAKER_MV,
+            output,
+            manifest,
+            plain["image"],
+            warnings=warnings,
+            errors=errors,
+        )
+
+    def extract_text(self, options: ExtractionOptions) -> TextExtractionResult:
+        game_root = resolve_game_root(normalize_path(options.source))
+        detection = pgmmv.detect_pixel_game_maker(game_root)
+        output_root = normalize_path(options.output)
+        output = output_root / "translation" / "translation.jsonl"
+        if detection.project_json is None or not detection.project_json.is_file():
+            return TextExtractionResult(
+                0,
+                None,
+                errors=["Resources/data/project.json was not found; no text could be exported."],
+            )
+
+        records, counts, warnings = pgmmv.extract_project_text(detection.project_json)
+        text_records = [
+            TextRecord(
+                file=relpath(detection.project_json, game_root),
+                path=record.context,
+                kind=f"pgmmv-text:{record.locale}",
+                text=record.text,
+                decoded=record.text,
+                decoders=("pgmmv-locale",),
+            )
+            for record in records
+        ]
+        count = write_unified_translation_records(
+            text_records, output, ENGINE_PIXEL_GAME_MAKER_MV
+        )
+        return TextExtractionResult(
+            count,
+            output,
+            warnings=warnings,
+            details={"locales": dict(sorted(counts.items()))},
+        )
+
+    def apply_translation(self, options: Any) -> PatchResult:
+        return PatchResult(
+            False,
+            errors=["Applying a translation back into a Pixel Game Maker MV project is not implemented yet."],
+        )
+
+
 def get_engine_adapter(engine: str) -> EngineAdapter:
     if engine == ENGINE_RPGMAKER_MV:
         return RpgMakerEngineAdapter(ENGINE_RPGMAKER_MV)
@@ -2807,6 +3030,8 @@ def get_engine_adapter(engine: str) -> EngineAdapter:
         return RpgMakerVxAceEngineAdapter()
     if engine == ENGINE_WOLF_RPG:
         return WolfRpgEngineAdapter()
+    if engine == ENGINE_PIXEL_GAME_MAKER_MV:
+        return PixelGameMakerEngineAdapter()
     raise ValueError(f"unsupported engine: {engine}")
 
 
@@ -2825,6 +3050,7 @@ def run_unified_extraction(options: ExtractionOptions) -> ExtractionResult:
         text_result = adapter.extract_text(options)
         resource_result.text_entries = text_result.count
         resource_result.manifest["text_entries_extracted"] = text_result.count
+        resource_result.manifest.update(text_result.details)
         resource_result.manifest["warnings"] = list(
             dict.fromkeys(resource_result.manifest.get("warnings", []) + text_result.warnings)
         )

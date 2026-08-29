@@ -127,6 +127,24 @@ class GuiSmokeTests(unittest.TestCase):
         self.window.mode_control.set_value(self.gui.MODE_PROJECT)
         self.assertEqual(self.window.output_name_edit.text(), "Marie's Adventure_project")
 
+    def test_pixel_game_maker_game_locks_to_full_extraction(self) -> None:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from test_pgmmv import make_pgmmv_game
+
+        game = make_pgmmv_game(Path(self._tmp.name))
+        self.window.mode_control.set_value(self.gui.MODE_FILES)
+        self.window.input_edit.setText(str(game))
+        self.assertEqual(self.window._engine_hint(), "pgmmv")
+        self.assertEqual(self.window._mode(), self.gui.MODE_EXTRACT)
+        self.assertFalse(self.window.mode_control._buttons[self.gui.MODE_PROJECT].isEnabled())
+        self.assertFalse(self.window.key_edit.isEnabled())
+        self.assertTrue(self.window.fonts_check.isEnabled())
+        self.assertIn("Pixel Game Maker MV", self.window.mode_hint.text())
+
+    def test_pixel_game_maker_engine_is_selectable(self) -> None:
+        items = [self.window.engine_combo.itemText(i) for i in range(self.window.engine_combo.count())]
+        self.assertIn(self.gui.ENGINE_PIXEL_GAME_MAKER_MV, items)
+
     def test_both_themes_produce_a_stylesheet(self) -> None:
         for name in ("dark", "light"):
             self.gui.THEME.use(name)

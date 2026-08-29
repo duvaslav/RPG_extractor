@@ -77,6 +77,8 @@ from unity_extractor import (
     extract_unity,
 )
 
+import pgmmv
+
 from rpg_maker_tool import (
     ASSET_EXTENSIONS,
     HEADER_LENGTH,
@@ -93,7 +95,9 @@ from rpg_maker_tool import (
     ENGINE_AUTO,
     ENGINE_RPGMAKER_MV,
     ENGINE_RPGMAKER_MZ,
+    ENGINE_PIXEL_GAME_MAKER_MV,
     ENGINE_RPGMAKER_VX_ACE,
+    ENGINE_UNKNOWN,
     ENGINE_WOLF_RPG,
     ExtractionOptions,
     find_keys,
@@ -827,25 +831,61 @@ class ToolWorker(QObject):
             return code
 
         input_path = normalize_path(Path(self.params["input"]))
-        jobs = collect_asset_jobs(input_path, None, {"image", "audio", "video"})
         self.log.emit("")
-        self.log.emit(f"Зашифрованных/переименованных файлов: {len(jobs)}")
-        by_kind = Counter(job.kind for job in jobs)
-        for kind, count in sorted(by_kind.items()):
-            self.log.emit(f"  {kind}: {count}")
-
-        plain = Counter()
-        for path in iter_files(input_path):
-            kind = PLAIN_ASSET_EXTENSIONS.get(path.suffix.lower())
-            if kind:
-                plain[kind] += 1
-        if plain:
+        self.log.emit("Считаю ресурсы по содержимому файлов…")
+        scan = pgmmv.scan_resources(
+            input_path,
+            progress=self.progress.emit,
+            cancelled=lambda: self.cancel_requested,
+        )
+        self.log.emit(f"Просмотрено файлов: {scan.total_files}")
+        if scan.protected_total:
             self.log.emit(
-                "Незашифрованных ассетов: "
-                + ", ".join(f"{kind}={count}" for kind, count in sorted(plain.items()))
+                "Защищённых/зашифрованных: "
+                + ", ".join(f"{kind}={count}" for kind, count in sorted(scan.protected.items()))
+                + f" (всего {scan.protected_total})"
             )
+            self.log.emit(
+                "Заголовки защиты: "
+                + ", ".join(f"{magic}×{count}" for magic, count in sorted(scan.protected_magics.items()))
+            )
+        else:
+            self.log.emit("Защищённых файлов не найдено")
+        if scan.plain_total:
+            self.log.emit(
+                "Открытых: "
+                + ", ".join(f"{kind}={count}" for kind, count in sorted(scan.plain.items()))
+                + f" (всего {scan.plain_total})"
+            )
+        if scan.unknown:
+            self.log.emit(f"Не удалось прочитать: {scan.unknown}")
+
+        jobs = collect_asset_jobs(input_path, None, {"image", "audio", "video"})
+        self.log.emit(f"Из них по расширениям RPG Maker: {len(jobs)}")
 
         self.log.emit("")
+        pgmmv_detection = pgmmv.detect_pixel_game_maker(
+            input_path if input_path.is_dir() else input_path.parent
+        )
+        if pgmmv_detection.confidence >= 0.35:
+            # RPG Maker key search would only report "nothing found" here: PGMMV
+            # keeps its protection metadata in info.json, in a format this tool
+            # cannot use yet.
+            self.log.emit(
+                "Ключ защиты: "
+                + (
+                    "метаданные найдены в Resources/data/info.json (формат защиты пока не поддержан)"
+                    if pgmmv_detection.has_protection_key
+                    else "метаданные в info.json не найдены"
+                )
+            )
+            if scan.protected_total:
+                self.log.emit(
+                    "Защищённые ресурсы Pixel Game Maker MV пока не расшифровываются — "
+                    "будут извлечены только открытые файлы и текст."
+                )
+            return code
+
         keys_code = self._run_keys()
         if jobs and keys_code != 0:
             self.log.emit(
@@ -1085,6 +1125,7 @@ class MainWindow(QMainWindow):
         self.worker: ToolWorker | None = None
         self.settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
         self.last_output: Path | None = None
+        self._engine_hint_cache: tuple[str, str | None] = ("", None)
         self.elapsed = QElapsedTimer()
         self.elapsed_timer = QTimer(self)
         self.elapsed_timer.setInterval(500)
@@ -1208,6 +1249,7 @@ class MainWindow(QMainWindow):
                 ENGINE_RPGMAKER_MZ,
                 ENGINE_RPGMAKER_VX_ACE,
                 ENGINE_WOLF_RPG,
+                ENGINE_PIXEL_GAME_MAKER_MV,
                 ENGINE_UNITY,
             ]
         )
@@ -1335,7 +1377,7 @@ class MainWindow(QMainWindow):
         self.text_check.setChecked(True)
         self.audio_check = QCheckBox("Аудио")
         self.video_check = QCheckBox("Видео RPG")
-        self.fonts_check = QCheckBox("Шрифты Unity")
+        self.fonts_check = QCheckBox("Шрифты")
         self.fonts_check.setChecked(True)
         for widget in (
             self.images_check,
@@ -1553,6 +1595,7 @@ class MainWindow(QMainWindow):
         if self.auto_name_check.isChecked():
             self._update_auto_output_name()
         self._update_output_preview()
+        self._apply_engine_mode()
 
     def _update_auto_output_name(self) -> None:
         if not self.auto_name_check.isChecked():
@@ -1626,22 +1669,60 @@ class MainWindow(QMainWindow):
         self._update_auto_output_name()
         self._update_output_preview()
 
+    def _engine_hint(self) -> str | None:
+        """Cheap guess at the engine behind the selected folder, cached per path.
+
+        Used only to decide which modes make sense; the real detection runs in
+        the worker.
+        """
+
+        text = self.input_edit.text().strip()
+        if self._engine_hint_cache[0] == text:
+            return self._engine_hint_cache[1]
+        hint: str | None = None
+        path = Path(text)
+        if text and path.exists():
+            try:
+                if detect_unity_input(path).confidence >= 0.65:
+                    hint = "unity"
+                else:
+                    root = path if path.is_dir() else path.parent
+                    if pgmmv.detect_pixel_game_maker(root).confidence >= 0.35:
+                        hint = "pgmmv"
+            except OSError:
+                hint = None
+        self._engine_hint_cache = (text, hint)
+        return hint
+
     def _apply_engine_mode(self) -> None:
         """Enable exactly the controls the current engine and mode can use."""
 
         engine = self.engine_combo.currentText()
-        is_unity = engine == ENGINE_UNITY
+        hint = self._engine_hint()
+        is_unity = engine == ENGINE_UNITY or (engine == ENGINE_AUTO and hint == "unity")
+        is_pgmmv = engine == ENGINE_PIXEL_GAME_MAKER_MV or (
+            engine == ENGINE_AUTO and hint == "pgmmv"
+        )
         is_auto = engine == ENGINE_AUTO
         mode = self._mode()
         project = mode == MODE_PROJECT
         files_only = mode == MODE_FILES
 
-        # Unity games can only be handled by the full extraction pipeline.
-        self.mode_control.set_option_enabled(MODE_FILES, not is_unity)
-        self.mode_control.set_option_enabled(MODE_PROJECT, not is_unity)
-        if is_unity and mode != MODE_EXTRACT:
+        # Unity and Pixel Game Maker MV are handled only by the full extraction
+        # pipeline: there is no RPG Maker style bulk decrypt and no editor
+        # project layout for them.
+        engine_locked = is_unity or is_pgmmv
+        self.mode_control.set_option_enabled(MODE_FILES, not engine_locked)
+        self.mode_control.set_option_enabled(MODE_PROJECT, not engine_locked)
+        if engine_locked and mode != MODE_EXTRACT:
             self.mode_control.set_value(MODE_EXTRACT)
             return
+        if is_pgmmv:
+            self.mode_hint.setText(
+                MODE_OUTPUT_HINTS[MODE_EXTRACT]
+                + " Pixel Game Maker MV: защищённые ресурсы пока не расшифровываются — "
+                "извлекаются открытые файлы и текст локалей из project.json."
+            )
 
         for widget in (
             self.key_label,
@@ -1649,7 +1730,7 @@ class MainWindow(QMainWindow):
             self.strict_check,
             self.force_xor_check,
         ):
-            widget.setEnabled(not is_unity)
+            widget.setEnabled(not is_unity and not is_pgmmv)
         self.preserve_time_check.setEnabled(not is_unity and not project)
         for widget in (self.comments_check, self.show_keys_check):
             widget.setEnabled(not is_unity and not project)
@@ -1664,7 +1745,9 @@ class MainWindow(QMainWindow):
         self.audio_check.setEnabled(not project)
         self.video_check.setEnabled(not is_unity and not project)
         self.text_check.setEnabled(not project and not files_only)
-        self.fonts_check.setEnabled((is_unity or is_auto) and not project and not files_only)
+        self.fonts_check.setEnabled(
+            (is_unity or is_pgmmv or is_auto) and not project and not files_only
+        )
 
         self.structure_card.setEnabled(not project)
         self.structure_switch.setEnabled(not project)
@@ -1681,6 +1764,8 @@ class MainWindow(QMainWindow):
             kinds.add("audio")
         if self.video_check.isChecked():
             kinds.add("video")
+        if self.fonts_check.isChecked():
+            kinds.add("font")
         return kinds
 
     def _params(self) -> dict[str, Any] | None:
@@ -1766,11 +1851,11 @@ class MainWindow(QMainWindow):
             params["engine"] == ENGINE_AUTO
             and detect_unity_input(Path(params["input"])).confidence >= 0.65
         )
-        if unity_mode and action in {"files", "project"}:
+        if action in {"files", "project"} and (unity_mode or self._engine_hint() == "pgmmv"):
             QMessageBox.information(
                 self,
-                "Unity",
-                "Для Unity доступен только режим «Полное извлечение».",
+                "Режим недоступен",
+                "Для Unity и Pixel Game Maker MV доступен только режим «Полное извлечение».",
             )
             return
         self.log_edit.clear()
@@ -1831,6 +1916,8 @@ class MainWindow(QMainWindow):
                 state = "ok" if detection.confidence >= 0.65 else (
                     "warn" if detection.confidence >= 0.35 else "error"
                 )
+                if detection.engine == ENGINE_UNKNOWN:
+                    state = "error"
                 self.engine_pill.set_state(
                     f"{detection.engine} · {detection.confidence:.2f}{edition}", state
                 )
