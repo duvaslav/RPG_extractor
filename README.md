@@ -153,6 +153,45 @@ python rpg_maker_tool.py project "D:\H14\Marie's Adventure" -o "D:\Projects\Mari
 
 ---
 
+## WOLF RPG и встроенные бэкенды
+
+Распаковку архивов `.wolf` делает `UberWolfCli`, текст извлекает `WolfTL` — обе программы
+сторонние (MIT, Sinflower). В репозитории их нет: положите файлы в `tools/` и соберите — см.
+[tools/README.md](tools/README.md) с версиями и хешами.
+
+**Порядок поиска** (`bundled_tools.py`):
+
+1. `sys._MEIPASS/tools` — внутри one-file EXE;
+2. `tools` рядом с EXE — portable / one-dir;
+3. `tools` рядом с исходниками;
+4. `UBERWOLF_CLI` / `WOLFTL_CLI`;
+5. `PATH`.
+
+**Проверка подлинности.** SHA-256 `UberWolfCli.exe` v0.6.4 закреплён в коде
+(`0C964573…B96FB3A`). Файл с другим хешем не запускается — программа сообщает об этом вместо
+тихого запуска чужого бинарника. Для своей сборки задайте `UBERWOLF_CLI_SHA256`.
+
+**Лицензии.** `licenses/UberWolf-LICENSE.txt` и `licenses/WolfTL-LICENSE.txt` попадают в EXE
+вместе с бинарниками — MIT требует, чтобы текст лицензии и copyright шли с программой.
+
+**Окно консоли.** Бэкенды запускаются с `CREATE_NO_WINDOW`, поэтому при работе GUI чёрное
+окно больше не появляется.
+
+**Частичный успех.** Отсутствие `WolfTL` больше не проваливает всю операцию: архивы
+распакованы — значит запуск успешен, а в журнал идёт отдельная строка
+«Текст не извлечён: …». В `manifest.json` это разведено на `errors` (сбой распаковки) и
+`text_errors` (не удалось извлечь текст) плюс флаг `resources_ok`.
+
+**Что видит конкретная сборка:**
+
+```
+python rpg_maker_tool.py tools          # где найдены бэкенды, совпадает ли хеш, есть ли лицензии
+python rpg_maker_tool.py tools --json
+```
+В GUI то же самое печатает «Проверить игру».
+
+---
+
 ## Имя папки вывода
 
 Название берётся из самой игры, а не из выбранной папки. Можно указать хоть
@@ -190,6 +229,8 @@ python rpg_maker_tool.py project "D:\H14\Marie's Adventure" -o "D:\Projects\Mari
 | `unity_extractor.py` | извлечение Unity-ассетов через UnityPy |
 | `output_structure.py` | раскладка вывода: плоская или с папками |
 | `pgmmv.py` | Pixel Game Maker MV: определение, разбор ресурсов, текст из project.json |
+| `bundled_tools.py` | поиск UberWolfCli/WolfTL в сборке, проверка SHA-256, скрытие консоли |
+| `tools/`, `licenses/` | место для сторонних бинарников и их лицензии |
 | `rpg_maker_gui.py` | окно PyQt6 |
 | `tests/` | тесты раскладки, режима проекта и smoke-тесты интерфейса |
 | `RPGMakerExtractor.spec` | сборка через PyInstaller |

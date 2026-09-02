@@ -36,7 +36,9 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Protocol
 from urllib.parse import unquote
 
+import bundled_tools
 import pgmmv
+from bundled_tools import UBERWOLF, WOLFTL
 from pgmmv import ENGINE_PIXEL_GAME_MAKER_MV
 
 from output_structure import (
@@ -309,6 +311,9 @@ class ExtractionResult:
     text_entries: int = 0
     warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # Problems that stopped the text pass only. Resources can be complete while
+    # this is non-empty — a missing WolfTL is the usual case.
+    text_errors: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1640,35 +1645,21 @@ def decrypt_asset_job(
 
 
 def find_executable(explicit: Path | None, env_name: str, names: list[str]) -> Path | None:
-    if explicit:
-        path = normalize_path(explicit)
-        return path if path.is_file() else None
-    env_value = os.environ.get(env_name)
-    if env_value:
-        path = normalize_path(Path(env_value))
-        if path.is_file():
-            return path
-    local_tools = Path(__file__).resolve().parent / "tools"
-    for name in names:
-        candidate = local_tools / name
-        if candidate.is_file():
-            return candidate
-    for name in names:
-        found = shutil.which(name)
-        if found:
-            return Path(found)
-    return None
+    """Backwards-compatible wrapper around the bundled-tool resolver."""
 
-
-def verify_optional_sha256(path: Path, env_name: str) -> None:
-    expected = os.environ.get(env_name)
-    if not expected:
-        return
-    actual = sha256_file(path)
-    if actual.lower() != expected.lower():
-        raise ValueError(
-            f"SHA-256 mismatch for {path}. Expected {expected}, got {actual}."
+    spec = next(
+        (item for item in bundled_tools.ALL_TOOLS if item.env_name == env_name),
+        None,
+    )
+    if spec is None:
+        spec = bundled_tools.ToolSpec(
+            key=env_name.lower(),
+            names=tuple(names),
+            env_name=env_name,
+            purpose=env_name,
+            license_file="",
         )
+    return bundled_tools.locate_tool(spec, explicit).path
 
 
 def run_backend_command(
@@ -1687,6 +1678,8 @@ def run_backend_command(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         check=False,
+        # Keeps a console window from flashing over the GUI on Windows.
+        **bundled_tools.no_window_kwargs(),
     )
     log_path.write_text(sanitize_sensitive_log(completed.stdout, show_keys), encoding="utf-8")
     return completed
@@ -1808,17 +1801,10 @@ def extract_wolf_archives(
             errors.append("WOLF RPG detected, but no Data folder or supported archives were found.")
         return extracted_dir
 
-    uberwolf = find_executable(
-        options.uberwolf_cli,
-        "UBERWOLF_CLI",
-        ["UberWolfCli.exe", "UberWolfCli"],
-    )
+    uberwolf, tool_error = bundled_tools.require_tool(UBERWOLF, options.uberwolf_cli)
     if uberwolf is None:
-        errors.append(
-            "UberWolfCli was not found. Set --uberwolf-cli or UBERWOLF_CLI to unpack encrypted WOLF archives."
-        )
+        errors.append(tool_error or bundled_tools.missing_tool_message(UBERWOLF))
         return extracted_dir
-    verify_optional_sha256(uberwolf, "UBERWOLF_CLI_SHA256")
 
     temp_parent = Path(tempfile.mkdtemp(prefix="rpg_wolf_"))
     try:
@@ -2159,12 +2145,15 @@ def extract_wolf_text_with_wolftl(
     logs_dir = output / "logs"
     translation_dir.mkdir(parents=True, exist_ok=True)
 
-    wolftl = find_executable(options.wolftl_cli, "WOLFTL_CLI", ["WolfTL.exe", "WolfTL"])
+    wolftl, tool_error = bundled_tools.require_tool(WOLFTL, options.wolftl_cli)
     if wolftl is None:
-        error = "WolfTL was not found. Set --wolftl-cli or WOLFTL_CLI to extract WOLF text."
-        errors.append(error)
-        return TextExtractionResult(0, warnings=warnings, errors=[error])
-    verify_optional_sha256(wolftl, "WOLFTL_CLI_SHA256")
+        # Resources may already be unpacked; only the text pass is affected, so
+        # this never goes into the extraction's own error list.
+        return TextExtractionResult(
+            0,
+            warnings=warnings,
+            errors=[tool_error or bundled_tools.missing_tool_message(WOLFTL)],
+        )
 
     data_folder = extracted_dir / "Data"
     if not data_folder.exists():
@@ -2175,7 +2164,6 @@ def extract_wolf_text_with_wolftl(
     completed = run_backend_command(command, logs_dir / "wolftl.log", cwd=output)
     if completed.returncode != 0:
         error = "The game was unpacked successfully, but MapData could not be parsed by WolfTL."
-        errors.append(error)
         return TextExtractionResult(0, output=translation_dir, warnings=warnings, errors=[error])
 
     entries = load_wolftl_dump_entries(work_dir / "dump", include_comments=options.include_comments)
@@ -2834,6 +2822,7 @@ class WolfRpgEngineAdapter:
         result = extract_wolf_text_with_wolftl(options, output / "extracted", manifest, warnings, errors)
         manifest["warnings"] = warnings
         manifest["errors"] = errors
+        manifest["text_errors"] = list(result.errors)
         manifest["text_entries_extracted"] = result.count
         atomic_write_json(manifest_path, manifest)
         return result
@@ -2842,10 +2831,9 @@ class WolfRpgEngineAdapter:
         translation = normalize_path(Path(options.translation))
         game = normalize_path(Path(options.game))
         output = normalize_path(Path(options.output))
-        wolftl = find_executable(getattr(options, "wolftl_cli", None), "WOLFTL_CLI", ["WolfTL.exe", "WolfTL"])
+        wolftl, tool_error = bundled_tools.require_tool(WOLFTL, getattr(options, "wolftl_cli", None))
         if wolftl is None:
-            return PatchResult(False, errors=["WolfTL was not found. Set --wolftl-cli or WOLFTL_CLI."])
-        verify_optional_sha256(wolftl, "WOLFTL_CLI_SHA256")
+            return PatchResult(False, errors=[tool_error or bundled_tools.missing_tool_message(WOLFTL)])
         output.mkdir(parents=True, exist_ok=True)
         patched_game = output / "patched-game"
         if patched_game.exists() and getattr(options, "overwrite", False):
@@ -3054,9 +3042,11 @@ def run_unified_extraction(options: ExtractionOptions) -> ExtractionResult:
         resource_result.manifest["warnings"] = list(
             dict.fromkeys(resource_result.manifest.get("warnings", []) + text_result.warnings)
         )
-        resource_result.manifest["errors"] = list(
-            dict.fromkeys(resource_result.manifest.get("errors", []) + text_result.errors)
+        resource_result.text_errors = list(text_result.errors)
+        resource_result.manifest["text_errors"] = list(
+            dict.fromkeys(resource_result.manifest.get("text_errors", []) + text_result.errors)
         )
+        resource_result.manifest["resources_ok"] = not resource_result.errors
         atomic_write_json(resource_result.output / "manifest.json", resource_result.manifest)
     return resource_result
 
@@ -3689,6 +3679,10 @@ def command_extract(args: argparse.Namespace) -> int:
         print("Warnings:")
         for item in result.warnings:
             print(f"  - {item}")
+    if result.text_errors:
+        print("Text was not extracted:")
+        for item in result.text_errors:
+            print(f"  - {item}")
     if result.errors:
         print("Errors:")
         for item in result.errors:
@@ -3727,6 +3721,37 @@ def command_project(args: argparse.Namespace) -> int:
     print(f"Files copied: {result.files_copied}")
     print(f"Files decrypted: {result.files_decrypted}")
     return 1 if result.errors else 0
+
+
+def command_tools(args: argparse.Namespace) -> int:
+    """Report which console backends this build can see, and whether they are pinned."""
+
+    statuses = bundled_tools.tool_report()
+    print(f"Frozen build: {'yes' if bundled_tools.is_frozen() else 'no'}")
+    for directory, label in bundled_tools.tool_search_dirs():
+        print(f"Search path: {directory} [{label}]{'' if directory.is_dir() else ' (missing)'}")
+    missing = 0
+    for status in statuses:
+        print()
+        print(f"{status.spec.names[0]} — {status.spec.purpose}")
+        if status.path is None:
+            missing += 1
+            print(f"  not found: {bundled_tools.missing_tool_message(status.spec)}")
+            continue
+        print(f"  path: {status.path}")
+        print(f"  source: {status.source}")
+        if status.expected_sha256:
+            print(f"  sha256: {status.sha256} ({'match' if status.hash_ok else 'MISMATCH'})")
+            if not status.hash_ok:
+                missing += 1
+        else:
+            print("  sha256: not pinned for this build")
+        license_path = bundled_tools.find_license(status.spec)
+        print(f"  license: {license_path if license_path else 'not bundled'}")
+    if args.json:
+        print()
+        print(json.dumps([status.as_dict() for status in statuses], ensure_ascii=False, indent=2))
+    return 1 if missing else 0
 
 
 def command_patch(args: argparse.Namespace) -> int:
@@ -3997,6 +4022,12 @@ def build_parser() -> argparse.ArgumentParser:
     project.add_argument("--no-strict", action="store_true")
     project.add_argument("--workers", type=int, default=0)
     project.set_defaults(func=command_project)
+
+    tools = subparsers.add_parser(
+        "tools", help="show which console backends (UberWolfCli, WolfTL) this build can find"
+    )
+    tools.add_argument("--json", action="store_true", help="also print a machine-readable report")
+    tools.set_defaults(func=command_tools)
 
     patch = subparsers.add_parser("patch", help="apply translation through the selected engine backend")
     patch.add_argument("translation", type=Path)

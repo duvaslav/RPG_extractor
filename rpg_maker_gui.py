@@ -77,6 +77,7 @@ from unity_extractor import (
     extract_unity,
 )
 
+import bundled_tools
 import pgmmv
 
 from rpg_maker_tool import (
@@ -815,12 +816,33 @@ class ToolWorker(QObject):
         self.log.emit(f"Text entries extracted: {manifest.get('text_entries_extracted', 0)}")
         for item in manifest.get("warnings", []):
             self.log.emit(f"Warning: {item}")
+        for item in result.text_errors:
+            self.log.emit(f"Текст не извлечён: {item}")
         for item in manifest.get("errors", []):
             self.log.emit(f"Error: {item}")
+
+        if not manifest.get("errors"):
+            archives = manifest.get("archives_processed", 0)
+            self.log.emit(
+                "Ресурсы распакованы"
+                + (f" (архивов: {archives})" if archives else "")
+                + (
+                    "; текст не извлечён — см. строки выше"
+                    if result.text_errors
+                    else ""
+                )
+            )
         self.progress.emit(1, 1)
         self.result.emit(
-            {"action": "extract-unified", "manifest": manifest, "output": str(result.output)}
+            {
+                "action": "extract-unified",
+                "manifest": manifest,
+                "output": str(result.output),
+                "text_errors": list(result.text_errors),
+            }
         )
+        # A missing WolfTL leaves the unpacked resources perfectly usable, so it
+        # does not turn the whole run into a failure.
         return 1 if manifest.get("errors") else 0
 
     def _run_check(self) -> int:
@@ -886,6 +908,7 @@ class ToolWorker(QObject):
                 )
             return code
 
+        self._log_backend_tools()
         keys_code = self._run_keys()
         if jobs and keys_code != 0:
             self.log.emit(
@@ -893,6 +916,23 @@ class ToolWorker(QObject):
             )
             return 1
         return code
+
+    def _log_backend_tools(self) -> None:
+        """Report the console backends, so a built EXE can be checked in place."""
+
+        statuses = bundled_tools.tool_report()
+        if all(status.path is None for status in statuses):
+            return
+        self.log.emit("")
+        for status in statuses:
+            name = status.spec.names[0]
+            if status.path is None:
+                self.log.emit(f"{name}: не найден ({status.spec.purpose})")
+            elif status.hash_ok is False:
+                self.log.emit(f"{name}: найден, но SHA-256 не совпадает — запуск заблокирован")
+            else:
+                pinned = "проверенная версия" if status.hash_ok else "версия не закреплена"
+                self.log.emit(f"{name}: {status.path} [{status.source}, {pinned}]")
 
     def _run_preview(self) -> int:
         mode = self.params.get("mode", MODE_FILES)
@@ -1126,6 +1166,7 @@ class MainWindow(QMainWindow):
         self.settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
         self.last_output: Path | None = None
         self._engine_hint_cache: tuple[str, str | None] = ("", None)
+        self.last_text_errors: list[str] = []
         self.elapsed = QElapsedTimer()
         self.elapsed_timer = QTimer(self)
         self.elapsed_timer.setInterval(500)
@@ -1859,6 +1900,7 @@ class MainWindow(QMainWindow):
             )
             return
         self.log_edit.clear()
+        self.last_text_errors = []
         self.progress_bar.setRange(0, 0)
         self.status_label.setText("Работаем…")
         self.elapsed.restart()
@@ -1923,6 +1965,7 @@ class MainWindow(QMainWindow):
                 )
             return
         if action in {"extract-unified", "files", "project"}:
+            self.last_text_errors = list(result.get("text_errors") or [])
             output = result.get("output")
             if output:
                 self.last_output = Path(output)
@@ -1950,7 +1993,10 @@ class MainWindow(QMainWindow):
             self.progress_bar.setRange(0, 1)
             self.progress_bar.setValue(1)
         labels = {0: "Готово", 130: "Отменено"}
-        self.status_label.setText(f"{labels.get(code, f'Код {code}')} · {self._elapsed_text()}")
+        label = labels.get(code, f"Код {code}")
+        if code == 0 and self.last_text_errors:
+            label = "Готово, без текста"
+        self.status_label.setText(f"{label} · {self._elapsed_text()}")
         self._append_log(f"Finished with code {code}.")
         self._set_busy(False)
 
